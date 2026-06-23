@@ -68,7 +68,7 @@ class DataConfig:
 
     # DataLoader settings
     batch_size: int = 32
-    num_workers: int = 4
+    num_workers: int = 1
     pin_memory: bool = True
 
     # Use WeightedRandomSampler to handle class imbalance in training set
@@ -93,7 +93,7 @@ class TrainingConfig:
     grad_clip: Optional[float] = 1.0
 
     # Early stopping: stop if val HTER does not improve for this many epochs
-    early_stopping_patience: int = 10
+    early_stopping_patience: int = 15
 
     # Save a checkpoint for every epoch (in addition to best.pth and last.pth)
     save_every_epoch: bool = False

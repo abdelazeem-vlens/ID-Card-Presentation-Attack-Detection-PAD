@@ -18,7 +18,7 @@ Each run creates a timestamped directory under experiments/ containing:
     train.log              — human-readable training log
     metrics.csv            — machine-readable epoch metrics
     checkpoints/
-        best.pth           — checkpoint with lowest val HTER
+        best.pth           — checkpoint with highest val AUC
         last.pth           — checkpoint from the most recent epoch
         epoch_XX.pth       — per-epoch checkpoints (if enabled in config)
     plots/                 — reserved for post-training plots
@@ -60,14 +60,14 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler,
     epoch: int,
-    best_hter: float,
+    best_auc: float,
     cfg: Config,
 ) -> None:
     """Save a full training checkpoint."""
     torch.save(
         {
             "epoch":      epoch,
-            "best_hter":  best_hter,
+            "best_hter":  best_auc,
             "model":      model.state_dict(),
             "optimizer":  optimizer.state_dict(),
             "scheduler":  scheduler.state_dict() if scheduler else None,
@@ -88,7 +88,7 @@ def load_checkpoint(
     Load a checkpoint into model, optimizer, scheduler.
 
     Returns:
-        (start_epoch, best_hter)
+        (start_epoch, best_auc)
     """
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model"])
@@ -221,7 +221,7 @@ def run_epoch(
 #  Main training loop                                                           #
 # --------------------------------------------------------------------------- #
 
-def train(cfg: Config, exp_dir: str, resume_epoch: int = 1, best_hter: float = 1.0):
+def train(cfg: Config, exp_dir: str, resume_epoch: int = 1, best_auc: float = 0.0):
     """Full training loop."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -268,7 +268,7 @@ def train(cfg: Config, exp_dir: str, resume_epoch: int = 1, best_hter: float = 1
     # ------------------------------------------------------------------ #
     if resume_epoch > 1:
         ckpt_path = os.path.join(exp_dir, "checkpoints", "last.pth")
-        resume_epoch, best_hter = load_checkpoint(ckpt_path, model, optimizer, scheduler, device)
+        resume_epoch, best_auc = load_checkpoint(ckpt_path, model, optimizer, scheduler, device)
         logger.log_resume(exp_dir, resume_epoch)
 
     # ------------------------------------------------------------------ #
@@ -329,25 +329,25 @@ def train(cfg: Config, exp_dir: str, resume_epoch: int = 1, best_hter: float = 1
             scheduler.step()
 
         # -------- Checkpointing --------
-        val_hter = val_metrics["hter"]
-        is_best  = val_hter < best_hter
+        val_auc = val_metrics["auc"]
+        is_best  = val_auc > best_auc
 
         if is_best:
-            best_hter = val_hter
+            best_auc = val_auc
             no_improve_count = 0
             best_path = os.path.join(exp_dir, "checkpoints", "best.pth")
-            save_checkpoint(best_path, model, optimizer, scheduler, epoch, best_hter, cfg)
+            save_checkpoint(best_path, model, optimizer, scheduler, epoch, best_auc, cfg)
             logger.log_checkpoint(epoch, best_path, is_best=True)
         else:
             no_improve_count += 1
 
         last_path = os.path.join(exp_dir, "checkpoints", "last.pth")
-        save_checkpoint(last_path, model, optimizer, scheduler, epoch, best_hter, cfg)
+        save_checkpoint(last_path, model, optimizer, scheduler, epoch, best_auc, cfg)
         logger.log_checkpoint(epoch, last_path, is_best=False)
 
         if cfg.training.save_every_epoch:
             epoch_path = os.path.join(exp_dir, "checkpoints", f"epoch_{epoch:03d}.pth")
-            save_checkpoint(epoch_path, model, optimizer, scheduler, epoch, best_hter, cfg)
+            save_checkpoint(epoch_path, model, optimizer, scheduler, epoch, best_auc, cfg)
 
         # -------- Early stopping --------
         if no_improve_count >= cfg.training.early_stopping_patience:
@@ -355,7 +355,7 @@ def train(cfg: Config, exp_dir: str, resume_epoch: int = 1, best_hter: float = 1
             break
 
     logger.separator("=")
-    logger.info(f"Training complete. Best val HTER: {best_hter:.4f}")
+    logger.info(f"Training complete. Best val AUC: {best_auc:.4f}")
     logger.separator("=")
 
 
