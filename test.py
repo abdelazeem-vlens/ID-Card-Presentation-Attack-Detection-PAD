@@ -18,7 +18,9 @@ Results are saved inside the experiment directory:
 
 import os
 import sys
+import csv
 import argparse
+from tqdm import tqdm
 
 import torch
 import matplotlib
@@ -155,8 +157,11 @@ def evaluate(exp_dir: str, checkpoint_name: str = "best.pth") -> None:
     # ------------------------------------------------------------------ #
     accumulator = MetricsAccumulator()
 
+    # Per-sample records for wrong_predictions.csv
+    all_records = []   # list of dicts: {path, true_label, score}
+
     with torch.no_grad():
-        for batch in test_loader:
+        for batch in tqdm(test_loader):
             images = batch["image"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
 
@@ -166,6 +171,18 @@ def evaluate(exp_dir: str, checkpoint_name: str = "best.pth") -> None:
             scores    = torch.sigmoid(cls_logit)          # (B,) probabilities
 
             accumulator.update(scores, labels)
+
+            # Store per-sample info (move back to CPU for storage)
+            for path, score, label in zip(
+                batch["path"],
+                scores.cpu().tolist(),
+                labels.cpu().tolist(),
+            ):
+                all_records.append({
+                    "image_path":  path,
+                    "true_label":  "real" if label == 0 else "replay",
+                    "score":       round(score, 6),
+                })
 
     # ------------------------------------------------------------------ #
     #  Metrics                                                             #
@@ -198,6 +215,37 @@ def evaluate(exp_dir: str, checkpoint_name: str = "best.pth") -> None:
         save_path=roc_path,
     )
     logger.info(f"ROC curve saved → {roc_path}")
+
+    # ------------------------------------------------------------------ #
+    #  Wrong predictions CSV                                               #
+    # ------------------------------------------------------------------ #
+    eer_threshold = metrics["eer_threshold"]
+
+    wrong = []
+    for record in all_records:
+        score       = record["score"]
+        true_label  = record["true_label"]
+        pred_label  = "replay" if score >= eer_threshold else "real"
+
+        if pred_label != true_label:
+            wrong.append({
+                "image_path":       record["image_path"],
+                "true_label":       true_label,
+                "predicted_label":  pred_label,
+                "score":            score,
+                "eer_threshold":    round(eer_threshold, 6),
+                "error_type":       "FAR" if true_label == "real" else "FRR",
+            })
+
+    wrong_csv_path = os.path.join(exp_dir, "wrong_predictions.csv")
+    fieldnames = ["image_path", "true_label", "predicted_label", "score", "eer_threshold", "error_type"]
+
+    with open(wrong_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(wrong)
+
+    logger.info(f"Wrong predictions : {len(wrong)} / {len(all_records)} saved → {wrong_csv_path}")
     logger.separator("=")
 
 
