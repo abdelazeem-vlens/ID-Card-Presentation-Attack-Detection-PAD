@@ -35,6 +35,14 @@ class ModelConfig:
     # Freeze backbone weights (only train heads) — useful for small datasets
     freeze_backbone: bool = False
 
+    # Stronger regularization knobs for the classification head / auxiliary branch
+    dropout_p: float = 0.3
+    aux_dropout_p: float = 0.0
+    stochastic_depth_prob: float = 0.0
+
+    # Freeze backbone stages 1 and 2 while fine-tuning later stages and heads
+    freeze_stages_12: bool = False
+
     # Stage index (1–4) from which the auxiliary branch taps its feature map
     # Stage 1 → early low-level features (highest spatial resolution)
     # Stage 2 → mid-level features
@@ -67,15 +75,20 @@ class DataConfig:
     norm_std: tuple = (0.229, 0.224, 0.225)
 
     # DataLoader settings
-    batch_size: int = 32
-    num_workers: int = 1
-    pin_memory: bool = True
+    batch_size: int = 16
+    num_workers: int = 0
+    pin_memory: bool = False
 
     # Use WeightedRandomSampler to handle class imbalance in training set
     use_weighted_sampler: bool = True
 
     # Whether to compute and return FFT frequency maps from the dataset
     compute_freq_map: bool = True
+
+    # Optional augmentations for the replay-attack training set
+    use_jpeg_compression: bool = True
+    use_gamma_augmentation: bool = True
+    use_moire_augmentation: bool = True
 
 
 @dataclass
@@ -88,6 +101,15 @@ class TrainingConfig:
     # Loss combination weights: total = lambda_cls * L_bce + lambda_freq * L_mse
     lambda_cls: float = 1.0
     lambda_freq: float = 0.5
+
+    # Label smoothing for classification loss (0.0 = disabled)
+    label_smoothing: float = 0.0
+
+    # Layer-wise LR decay factor for backbone stages (1.0 = disabled)
+    layerwise_lr_decay: float = 1.0
+
+    # Whether to run test-time augmentation at evaluation time
+    use_tta: bool = False
 
     # Gradient clipping max norm (None to disable)
     grad_clip: Optional[float] = 1.0

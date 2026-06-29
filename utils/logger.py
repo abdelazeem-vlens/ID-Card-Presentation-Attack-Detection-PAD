@@ -23,6 +23,19 @@ from datetime import datetime
 from typing import Dict, Optional
 
 
+def append_global_metrics(exp_root: str, phase: str, exp_name: str, epoch: int, metrics: Dict[str, float]) -> None:
+    """Append one metrics row to a global log file for a given split."""
+    os.makedirs(exp_root, exist_ok=True)
+    log_path = os.path.join(exp_root, f"global_{phase.lower()}.log")
+    metric_parts = []
+    for key in ["mean_loss", "eer", "far_at_eer", "frr_at_eer", "hter", "auc", "eer_threshold"]:
+        if key in metrics:
+            metric_parts.append(f"{key}={metrics[key]:.6f}")
+    metric_str = " ".join(metric_parts)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | experiment={exp_name} | epoch={epoch} | phase={phase.upper()} | {metric_str}\n")
+
+
 class ExperimentLogger:
     """
     One logger per experiment run.

@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 from config import Config
 from dataset import get_dataloader
 from model import build_model
-from utils import MetricsAccumulator, ExperimentLogger
+from utils import MetricsAccumulator, ExperimentLogger, append_global_metrics
 
 
 # --------------------------------------------------------------------------- #
@@ -166,9 +166,18 @@ def evaluate(exp_dir: str, checkpoint_name: str = "best.pth") -> None:
             labels = batch["label"].to(device, non_blocking=True)
 
             # Inference mode: auxiliary branch disabled
-            out = model(images, training=False)
-            cls_logit = out["cls_logit"].squeeze(1)       # (B,)
-            scores    = torch.sigmoid(cls_logit)          # (B,) probabilities
+            if cfg.training.use_tta:
+                variants = [images, torch.flip(images, dims=[-1]), torch.clamp(images * 1.03, 0.0, 1.0)]
+                scores_list = []
+                for variant in variants:
+                    out = model(variant.to(device), training=False)
+                    cls_logit = out["cls_logit"].squeeze(1)
+                    scores_list.append(torch.sigmoid(cls_logit).cpu())
+                scores = torch.stack(scores_list).mean(dim=0)
+            else:
+                out = model(images, training=False)
+                cls_logit = out["cls_logit"].squeeze(1)       # (B,)
+                scores    = torch.sigmoid(cls_logit)          # (B,) probabilities
 
             accumulator.update(scores, labels)
 
@@ -200,6 +209,13 @@ def evaluate(exp_dir: str, checkpoint_name: str = "best.pth") -> None:
 
     # Write to CSV (reuse logger._write_csv directly)
     logger._write_csv(epoch=trained_epoch, phase="TEST", metrics=metrics)
+    append_global_metrics(
+        exp_root=os.path.dirname(exp_dir),
+        phase="test",
+        exp_name=os.path.basename(exp_dir),
+        epoch=trained_epoch,
+        metrics=metrics,
+    )
 
     # ------------------------------------------------------------------ #
     #  ROC curve plot                                                       #

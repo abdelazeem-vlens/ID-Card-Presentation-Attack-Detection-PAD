@@ -160,6 +160,10 @@ class ConvNeXtWithFreqBranch(nn.Module):
         aux_stage: int = 2,
         freq_map_size: Tuple[int, int] = (28, 28),
         aux_hidden_dim: int = 64,
+        dropout_p: float = 0.3,
+        aux_dropout_p: float = 0.0,
+        stochastic_depth_prob: float = 0.0,
+        freeze_stages_12: bool = False,
     ) -> None:
         super().__init__()
 
@@ -177,9 +181,9 @@ class ConvNeXtWithFreqBranch(nn.Module):
         #  Backbone                                                          #
         # ---------------------------------------------------------------- #
         if pretrained:
-            backbone = factory(weights=weights)
+            backbone = factory(weights=weights, stochastic_depth_prob=stochastic_depth_prob)
         else:
-            backbone = factory(weights=None)
+            backbone = factory(weights=None, stochastic_depth_prob=stochastic_depth_prob)
 
         # ConvNeXt from torchvision has the structure:
         #   backbone.features[0]   → stem (downsampling patch embed)
@@ -206,13 +210,19 @@ class ConvNeXtWithFreqBranch(nn.Module):
             for param in self.backbone_features.parameters():
                 param.requires_grad = False
 
+        if freeze_stages_12:
+            for stage_idx in [1, 3]:
+                module = self.backbone_features[stage_idx]
+                for param in module.parameters():
+                    param.requires_grad = False
+
         # ---------------------------------------------------------------- #
         #  Classification head                                              #
         # ---------------------------------------------------------------- #
         self.cls_head = nn.Sequential(
             nn.Linear(final_channels, 256),
             nn.GELU(),
-            nn.Dropout(p=0.3),
+            nn.Dropout(p=dropout_p),
             nn.Linear(256, 1),   # raw logit; apply sigmoid externally
         )
 
@@ -225,6 +235,8 @@ class ConvNeXtWithFreqBranch(nn.Module):
             freq_map_size=freq_map_size,
             hidden_dim=aux_hidden_dim,
         )
+        self.aux_dropout = nn.Dropout(p=aux_dropout_p)
+        self.stochastic_depth_prob = stochastic_depth_prob
 
         # ---------------------------------------------------------------- #
         #  Forward hook to capture the intermediate feature map            #
@@ -262,7 +274,9 @@ class ConvNeXtWithFreqBranch(nn.Module):
         result = {"cls_logit": cls_logit}
 
         if training and self._aux_feature is not None:
-            freq_pred = self.aux_branch(self._aux_feature)   # (B, 1, fH, fW)
+            aux_feature = self._aux_feature
+            aux_feature = self.aux_dropout(aux_feature)
+            freq_pred = self.aux_branch(aux_feature)   # (B, 1, fH, fW)
             result["freq_pred"] = freq_pred
 
         return result
@@ -316,6 +330,10 @@ def build_model(cfg) -> nn.Module:
             freeze_backbone=cfg.model.freeze_backbone,
             aux_stage=cfg.model.aux_branch_stage,
             freq_map_size=cfg.frequency.freq_map_size,
+            dropout_p=cfg.model.dropout_p,
+            aux_dropout_p=cfg.model.aux_dropout_p,
+            stochastic_depth_prob=cfg.model.stochastic_depth_prob,
+            freeze_stages_12=cfg.model.freeze_stages_12,
         )
 
     raise ValueError(

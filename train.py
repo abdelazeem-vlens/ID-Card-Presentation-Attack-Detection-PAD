@@ -27,28 +27,31 @@ Each run creates a timestamped directory under experiments/ containing:
 import os
 import sys
 import argparse
+import copy
 from datetime import datetime
 from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 
 from config import Config
 from dataset import get_dataloader
 from model import build_model
-from utils import MetricsAccumulator, ExperimentLogger
+from utils import MetricsAccumulator, ExperimentLogger, append_global_metrics
 
 
 # --------------------------------------------------------------------------- #
 #  Experiment setup helpers                                                     #
 # --------------------------------------------------------------------------- #
 
-def create_experiment_dir(cfg: Config) -> str:
+def create_experiment_dir(cfg: Config, name: Optional[str] = None) -> str:
     """Create a timestamped experiment directory and required subdirs."""
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    exp_dir = os.path.join(cfg.paths.experiments_root, timestamp)
+    suffix = f"_{name}" if name else ""
+    exp_dir = os.path.join(cfg.paths.experiments_root, f"{timestamp}{suffix}")
     os.makedirs(os.path.join(exp_dir, "checkpoints"), exist_ok=True)
     os.makedirs(os.path.join(exp_dir, "plots"), exist_ok=True)
     return exp_dir
@@ -128,6 +131,35 @@ def get_warmup_lr(base_lr: float, warmup_factor: float, epoch: int, warmup_epoch
     return base_lr * (warmup_factor + (1.0 - warmup_factor) * progress)
 
 
+def build_optimizer(model: nn.Module, cfg: Config):
+    """Create an AdamW optimizer with optional layer-wise LR decay."""
+    base_lr = cfg.training.learning_rate
+    weight_decay = cfg.training.weight_decay
+    decay_factor = cfg.training.layerwise_lr_decay
+
+    if decay_factor <= 1.0:
+        return AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+
+    param_groups = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        if name.startswith("backbone_features.1") or name.startswith("backbone_features.3"):
+            lr = base_lr * (decay_factor ** 2)
+        elif name.startswith("backbone_features.5") or name.startswith("backbone_features.7"):
+            lr = base_lr * decay_factor
+        else:
+            lr = base_lr
+
+        param_groups.append({"params": [param], "lr": lr, "weight_decay": weight_decay})
+
+    if not param_groups:
+        return AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+
+    return AdamW(param_groups, lr=base_lr, weight_decay=weight_decay)
+
+
 # --------------------------------------------------------------------------- #
 #  Train / Validate one epoch                                                   #
 # --------------------------------------------------------------------------- #
@@ -164,7 +196,6 @@ def run_epoch(
     model.train(is_train)
     accumulator.reset()
 
-    cls_criterion = nn.BCEWithLogitsLoss()
     freq_criterion = nn.MSELoss()
 
     total_steps = len(loader)
@@ -182,7 +213,11 @@ def run_epoch(
             freq_pred = out.get("freq_pred")               # (B, 1, fH, fW) or None
 
             # Losses
-            l_cls  = cls_criterion(cls_logit, labels.float())
+            targets = labels.float()
+            if cfg.training.label_smoothing > 0.0:
+                smoothing = cfg.training.label_smoothing
+                targets = targets * (1.0 - smoothing) + 0.5 * smoothing
+            l_cls = F.binary_cross_entropy_with_logits(cls_logit, targets)
             l_freq = freq_criterion(freq_pred, freq_gt) if freq_pred is not None else torch.tensor(0.0, device=device)
             loss   = cfg.training.lambda_cls * l_cls + cfg.training.lambda_freq * l_freq
 
@@ -256,11 +291,7 @@ def train(cfg: Config, exp_dir: str, resume_epoch: int = 1, best_auc: float = 0.
     #  Model, optimizer, scheduler                                         #
     # ------------------------------------------------------------------ #
     model = build_model(cfg).to(device)
-    optimizer = AdamW(
-        model.parameters(),
-        lr=cfg.training.learning_rate,
-        weight_decay=cfg.training.weight_decay,
-    )
+    optimizer = build_optimizer(model, cfg)
     scheduler = build_scheduler(optimizer, cfg, steps_after_warmup=0)
 
     # ------------------------------------------------------------------ #
@@ -308,6 +339,13 @@ def train(cfg: Config, exp_dir: str, resume_epoch: int = 1, best_auc: float = 0.
             accumulator=train_acc,
         )
         logger.log_metrics(epoch, "TRAIN", train_metrics)
+        append_global_metrics(
+            exp_root=os.path.dirname(exp_dir),
+            phase="train",
+            exp_name=os.path.basename(exp_dir),
+            epoch=epoch,
+            metrics=train_metrics,
+        )
 
         # -------- Validate --------
         val_metrics = run_epoch(
@@ -322,6 +360,13 @@ def train(cfg: Config, exp_dir: str, resume_epoch: int = 1, best_auc: float = 0.
             accumulator=val_acc,
         )
         logger.log_metrics(epoch, "VAL", val_metrics)
+        append_global_metrics(
+            exp_root=os.path.dirname(exp_dir),
+            phase="val",
+            exp_name=os.path.basename(exp_dir),
+            epoch=epoch,
+            metrics=val_metrics,
+        )
         logger.separator()
 
         # -------- Scheduler step (after warmup) --------
@@ -377,7 +422,42 @@ def parse_args():
         default=None,
         help="Path to an existing experiment directory to resume training from.",
     )
+    parser.add_argument(
+        "--run-experiments",
+        action="store_true",
+        help="Run the recommended experiment sequence sequentially for 15 epochs each.",
+    )
     return parser.parse_args()
+
+
+def run_experiment_sequence(base_cfg: Config):
+    """Run the recommended regularization and augmentation experiments in order."""
+    experiments = [
+        ("baseline_reg", {"training.num_epochs": 15, "training.learning_rate": 1e-4, "training.weight_decay": 1e-2, "model.dropout_p": 0.5, "model.aux_dropout_p": 0.2}),
+        ("jpeg_aug", {"training.num_epochs": 15, "data.use_jpeg_compression": True, "data.use_gamma_augmentation": False, "data.use_moire_augmentation": False}),
+        ("label_smoothing", {"training.num_epochs": 15, "training.label_smoothing": 0.1}),
+        ("llrd", {"training.num_epochs": 15, "training.layerwise_lr_decay": 0.8}),
+        ("freeze_stages12", {"training.num_epochs": 15, "model.freeze_stages_12": True}),
+        ("stochastic_depth", {"training.num_epochs": 15, "model.stochastic_depth_prob": 0.2}),
+    ]
+
+    root = base_cfg.paths.experiments_root
+    os.makedirs(root, exist_ok=True)
+
+    for name, overrides in experiments:
+        cfg = copy.deepcopy(base_cfg)
+        for key, value in overrides.items():
+            parts = key.split(".")
+            target = cfg
+            for part in parts[:-1]:
+                target = getattr(target, part)
+            setattr(target, parts[-1], value)
+
+        exp_dir = create_experiment_dir(cfg, name)
+        cfg.save(os.path.join(exp_dir, "config_snapshot.yaml"))
+        train(cfg, exp_dir, resume_epoch=1)
+        from test import evaluate
+        evaluate(exp_dir, checkpoint_name="best.pth")
 
 
 if __name__ == "__main__":
@@ -385,17 +465,19 @@ if __name__ == "__main__":
 
     # ---- Load or create config ----
     if args.resume:
-        # Resume: reload config from the experiment's snapshot
         snap_path = os.path.join(args.resume, "config_snapshot.yaml")
         if not os.path.exists(snap_path):
             sys.exit(f"[ERROR] Config snapshot not found at: {snap_path}")
         cfg = Config.from_yaml(snap_path)
         exp_dir = args.resume
-        resume_epoch = 2   # actual epoch will be read from checkpoint in train()
+        resume_epoch = 2
     else:
         cfg = Config.from_yaml(args.config) if args.config else Config()
         exp_dir = create_experiment_dir(cfg)
         cfg.save(os.path.join(exp_dir, "config_snapshot.yaml"))
         resume_epoch = 1
 
-    train(cfg, exp_dir, resume_epoch=resume_epoch)
+    if args.run_experiments:
+        run_experiment_sequence(cfg)
+    else:
+        train(cfg, exp_dir, resume_epoch=resume_epoch)

@@ -26,12 +26,15 @@ Each __getitem__ returns a dict:
 """
 
 import os
+import random
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 from PIL import Image
+import albumentations as A
 
 from config import Config
 from utils.frequency import compute_freq_map
@@ -184,6 +187,52 @@ class IDCardDataset(Dataset):
 #  Transform factories                                                          #
 # --------------------------------------------------------------------------- #
 
+class MoireAugmentation(object):
+    """Apply a mild synthetic moiré pattern to a PIL image."""
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        if random.random() > 0.35:
+            return image
+
+        image_np = np.array(image, dtype=np.float32) / 255.0
+        h, w = image_np.shape[:2]
+        freq = random.uniform(8.0, 20.0)
+        angle = random.uniform(0.0, np.pi)
+        yy, xx = np.mgrid[0:h, 0:w]
+        pattern = np.sin((xx * np.cos(angle) + yy * np.sin(angle)) / freq)
+        pattern = 0.5 + 0.12 * pattern
+        image_np = np.clip(image_np * pattern[..., None], 0.0, 1.0)
+        return Image.fromarray((image_np * 255.0).astype(np.uint8)).convert("RGB")
+
+
+class AlbumentationsJPEGWrapper(object):
+    """Apply JPEG compression simulation with albumentations."""
+
+    def __init__(self, p: float = 0.5) -> None:
+        self.transform = A.Compose([
+            A.ImageCompression(quality_range=(50, 95), p=1.0),
+        ], p=p)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        image_np = np.array(image)
+        augmented = self.transform(image=image_np)["image"]
+        return Image.fromarray(augmented).convert("RGB")
+
+
+class AlbumentationsGammaWrapper(object):
+    """Apply random gamma correction with albumentations."""
+
+    def __init__(self, p: float = 0.5) -> None:
+        self.transform = A.Compose([
+            A.RandomGamma(gamma_limit=(80, 120), p=1.0),
+        ], p=p)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        image_np = np.array(image)
+        augmented = self.transform(image=image_np)["image"]
+        return Image.fromarray(augmented).convert("RGB")
+
+
 def build_train_transforms(cfg: Config) -> transforms.Compose:
     """
     Augmentation pipeline for training.
@@ -198,7 +247,7 @@ def build_train_transforms(cfg: Config) -> transforms.Compose:
     """
     h, w = cfg.data.image_size
 
-    return transforms.Compose([
+    transforms_list = [
         transforms.Resize((int(h * 1.1), int(w * 1.1))),   # slight oversize for crop
         transforms.RandomCrop((h, w)),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -213,13 +262,27 @@ def build_train_transforms(cfg: Config) -> transforms.Compose:
             [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))],
             p=0.3,
         ),
-        transforms.RandomApply(
-            [transforms.RandomAdjustSharpness(sharpness_factor=0)],  # simulates blur/compression
-            p=0.2,
-        ),
+    ]
+
+    if cfg.data.use_jpeg_compression:
+        transforms_list.append(
+            transforms.RandomApply([AlbumentationsJPEGWrapper(p=1.0)], p=0.35)
+        )
+
+    if cfg.data.use_gamma_augmentation:
+        transforms_list.append(
+            transforms.RandomApply([AlbumentationsGammaWrapper(p=1.0)], p=0.35)
+        )
+
+    if cfg.data.use_moire_augmentation:
+        transforms_list.append(MoireAugmentation())
+
+    transforms_list.extend([
         transforms.ToTensor(),
         transforms.Normalize(mean=cfg.data.norm_mean, std=cfg.data.norm_std),
     ])
+
+    return transforms.Compose(transforms_list)
 
 
 def build_eval_transforms(cfg: Config) -> transforms.Compose:
