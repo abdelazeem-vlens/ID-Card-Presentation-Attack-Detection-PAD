@@ -25,6 +25,7 @@ Each __getitem__ returns a dict:
     }
 """
 
+import inspect
 import os
 import random
 from typing import Dict, List, Optional, Tuple
@@ -205,12 +206,28 @@ class MoireAugmentation(object):
         return Image.fromarray((image_np * 255.0).astype(np.uint8)).convert("RGB")
 
 
+def _build_image_compression_transform(p: float = 1.0):
+    """Create an image compression transform compatible with older/newer Albumentations versions."""
+    try:
+        signature = inspect.signature(A.ImageCompression)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is not None and "quality_range" in signature.parameters:
+        return A.ImageCompression(quality_range=(50, 95), p=p)
+
+    if signature is not None and {"quality_lower", "quality_upper"}.issubset(signature.parameters):
+        return A.ImageCompression(quality_lower=50, quality_upper=95, p=p)
+
+    return A.ImageCompression(quality_lower=50, quality_upper=95, p=p)
+
+
 class AlbumentationsJPEGWrapper(object):
     """Apply JPEG compression simulation with albumentations."""
 
     def __init__(self, p: float = 0.5) -> None:
         self.transform = A.Compose([
-            A.ImageCompression(quality_range=(50, 95), p=1.0),
+            _build_image_compression_transform(p=1.0),
         ], p=p)
 
     def __call__(self, image: Image.Image) -> Image.Image:
